@@ -22,6 +22,16 @@ pub enum Variant {
     All,
 }
 
+impl Variant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Variant::Source => "source",
+            Variant::Best => "best",
+            Variant::All => "all",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Layout {
     /// `<dest>/2023/2023-07-14/GX010123.MP4`

@@ -36,6 +36,14 @@ pub struct Manifest {
     pub library_items: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub library_bytes: Option<u64>,
+    /// Media id -> the `--variant`/`--sidecars` profile under which *every*
+    /// asset of that item was successfully fetched.
+    ///
+    /// Recorded at the item level, and only on full success. Per-file records
+    /// cannot express this: an item whose second asset failed would have a
+    /// first file that looks complete, and would be skipped forever.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub completed: BTreeMap<String, String>,
     /// Keyed by `{media_id}::{asset_key}` — one media item can yield several
     /// files (chapters, bursts, sidecars).
     pub entries: BTreeMap<String, Entry>,
@@ -48,6 +56,7 @@ impl Default for Manifest {
             last_sync: None,
             library_items: None,
             library_bytes: None,
+            completed: BTreeMap::new(),
             entries: BTreeMap::new(),
         }
     }
@@ -129,15 +138,48 @@ impl Manifest {
         self.entries.values().map(|e| PathBuf::from(&e.rel_path)).collect()
     }
 
+    /// Every entry belonging to one media item, without scanning the whole map.
+    fn entries_for<'a>(&'a self, media_id: &str) -> impl Iterator<Item = &'a Entry> + 'a {
+        let prefix = format!("{media_id}::");
+        self.entries
+            .range(prefix.clone()..)
+            .take_while(move |(k, _)| k.starts_with(&prefix))
+            .map(|(_, e)| e)
+    }
+
     /// Paths already recorded for one media item, keyed by asset. A restart
     /// reuses these instead of re-deriving a name that may differ.
     pub fn recorded_for(&self, media_id: &str) -> HashMap<String, PathBuf> {
-        let prefix = format!("{media_id}::");
-        self.entries
-            .iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, e)| (e.asset_key.clone(), PathBuf::from(&e.rel_path)))
+        self.entries_for(media_id)
+            .map(|e| (e.asset_key.clone(), PathBuf::from(&e.rel_path)))
             .collect()
+    }
+
+    /// True when this item needs no work at all, so the run can skip it without
+    /// asking GoPro for download links — the difference between 2835 pointless
+    /// API calls on a resumed run and none.
+    ///
+    /// Requires the recorded files to still be present at their recorded sizes,
+    /// which is cheap (one `stat` each) and catches a wiped or half-restored
+    /// disk that the manifest alone would happily lie about.
+    pub fn item_complete(&self, dest: &Path, media_id: &str, profile: &str) -> bool {
+        if self.completed.get(media_id).map(String::as_str) != Some(profile) {
+            return false;
+        }
+        let mut saw_any = false;
+        for entry in self.entries_for(media_id) {
+            saw_any = true;
+            match std::fs::metadata(dest.join(&entry.rel_path)) {
+                Ok(m) if m.len() == entry.bytes => {}
+                _ => return false,
+            }
+        }
+        saw_any
+    }
+
+    /// Call only when every asset planned for this item is on disk.
+    pub fn mark_complete(&mut self, media_id: &str, profile: &str) {
+        self.completed.insert(media_id.to_string(), profile.to_string());
     }
 
     /// Distinct media items with at least one file on record.
@@ -206,5 +248,102 @@ mod tests {
         // Truncated by a bad unmount: must be re-downloaded, not skipped.
         std::fs::write(dir.path().join("a/GX010123.MP4"), b"a").unwrap();
         assert!(!m.is_done(dir.path(), "abc", "source:0"));
+    }
+
+    #[test]
+    fn a_complete_item_needs_no_network_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = Manifest::default();
+        m.insert(entry("a/GX010123.MP4", 3));
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a/GX010123.MP4"), b"abc").unwrap();
+
+        assert!(!m.item_complete(dir.path(), "abc", "source"), "not marked complete yet");
+        m.mark_complete("abc", "source");
+        assert!(m.item_complete(dir.path(), "abc", "source"));
+        assert!(!m.item_complete(dir.path(), "never-seen", "source"));
+    }
+
+    #[test]
+    fn changing_the_variant_reopens_the_item() {
+        // Recorded under `source`; asking for `all` may need more assets, so the
+        // item must not be skipped on the strength of the original alone.
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = Manifest::default();
+        m.insert(entry("a/GX010123.MP4", 3));
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a/GX010123.MP4"), b"abc").unwrap();
+        m.mark_complete("abc", "source");
+
+        assert!(m.item_complete(dir.path(), "abc", "source"));
+        assert!(!m.item_complete(dir.path(), "abc", "all"));
+        assert!(!m.item_complete(dir.path(), "abc", "source+sidecars"));
+    }
+
+    #[test]
+    fn a_vanished_file_reopens_the_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = Manifest::default();
+        m.insert(entry("a/GX010123.MP4", 3));
+        m.mark_complete("abc", "source");
+        assert!(!m.item_complete(dir.path(), "abc", "source"), "file was never written");
+    }
+
+    #[test]
+    fn one_missing_asset_reopens_the_whole_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = Manifest::default();
+        m.insert(entry("a/GX010123.MP4", 3));
+        let mut second = entry("a/GX010123-proxy.mp4", 3);
+        second.asset_key = "edit_proxy:0".into();
+        m.insert(second);
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a/GX010123.MP4"), b"abc").unwrap();
+        m.mark_complete("abc", "source");
+        // The proxy is absent.
+        assert!(!m.item_complete(dir.path(), "abc", "source"));
+    }
+
+    #[test]
+    fn entries_for_does_not_leak_across_media_ids() {
+        let mut m = Manifest::default();
+        let mut a = entry("a.MP4", 1);
+        a.media_id = "abc".into();
+        let mut b = entry("b.MP4", 1);
+        b.media_id = "abcdef".into();
+        m.insert(a);
+        m.insert(b);
+        assert_eq!(m.recorded_for("abc").len(), 1, "prefix must not match abcdef");
+        assert_eq!(m.recorded_for("abcdef").len(), 1);
+    }
+
+    #[test]
+    fn a_partly_failed_item_is_never_marked_complete() {
+        // The regression this design exists for: one asset lands, a second
+        // fails, so the item must stay open rather than looking finished.
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = Manifest::default();
+        m.insert(entry("a/GX010123.MP4", 3));
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a/GX010123.MP4"), b"abc").unwrap();
+
+        // mark_complete is not called, because the run did not finish the item.
+        assert!(!m.item_complete(dir.path(), "abc", "all"));
+        assert!(!m.item_complete(dir.path(), "abc", "source"));
+    }
+
+    #[test]
+    fn an_old_manifest_without_completion_records_is_rechecked_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = r#"{"version":1,"entries":{"abc::original:0":{
+            "media_id":"abc","asset_key":"original:0","rel_path":"a/GX010123.MP4",
+            "bytes":3,"completed_at":"2026-01-01T00:00:00Z"}}}"#;
+        std::fs::create_dir_all(dir.path().join(STATE_DIR)).unwrap();
+        std::fs::write(path_for(dir.path()), raw).unwrap();
+
+        let m = Manifest::load(dir.path()).unwrap();
+        assert_eq!(m.entries.len(), 1, "old entries still load");
+        assert!(m.completed.is_empty());
+        assert!(!m.item_complete(dir.path(), "abc", "source"), "must re-check once");
     }
 }

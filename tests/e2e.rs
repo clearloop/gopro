@@ -41,6 +41,8 @@ struct Fake {
     served: Mutex<HashSet<String>>,
     /// How many times the client walked the media listing.
     searches: Mutex<usize>,
+    /// How many times it asked for an item's signed download links.
+    downloads: Mutex<usize>,
     mode: Mode,
 }
 
@@ -51,6 +53,7 @@ async fn spawn_api(mode: Mode) -> String {
     let state = Arc::new(Fake {
         served: Mutex::new(HashSet::new()),
         searches: Mutex::new(0),
+        downloads: Mutex::new(0),
         mode,
     });
     let base_for_handler = base.clone();
@@ -93,9 +96,14 @@ async fn spawn_api(mode: Mode) -> String {
                     return;
                 }
 
-                if path == "/debug/searches" {
-                    let n = *state.searches.lock().unwrap();
-                    let _ = write_json(&mut wr, &format!("{{\"searches\":{n}}}")).await;
+                if path == "/debug/counts" {
+                    let s = *state.searches.lock().unwrap();
+                    let d = *state.downloads.lock().unwrap();
+                    let _ = write_json(
+                        &mut wr,
+                        &format!("{{\"searches\":{s},\"downloads\":{d}}}"),
+                    )
+                    .await;
                 } else if path == "/media/user" {
                     let n = if state.mode == Mode::AlwaysFail { 30 } else { 2 };
                     let _ = write_json(
@@ -112,6 +120,7 @@ async fn spawn_api(mode: Mode) -> String {
                     let json = if page == "1" { search_page(n) } else { empty_page() };
                     let _ = write_json(&mut wr, &json).await;
                 } else if path.starts_with("/media/") && path.ends_with("/download") {
+                    *state.downloads.lock().unwrap() += 1;
                     let id = path.trim_start_matches("/media/").trim_end_matches("/download");
                     let _ = write_json(&mut wr, &download_json(&base, id)).await;
                 } else if state.mode == Mode::AlwaysFail && path.starts_with("/cdn/") {
@@ -462,11 +471,23 @@ async fn a_run_that_fails_every_item_gives_up_instead_of_grinding_on() {
     assert!(attempted < 25, "gave up too late: {attempted} attempts");
 }
 
+async fn counts(base: &str) -> (usize, usize) {
+    let body = reqwest_get(&format!("{base}/debug/counts")).await;
+    let pick = |key: &str| -> usize {
+        let tail = body
+            .split(&format!("\"{key}\":"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("no `{key}` in debug body: {body:?}"));
+        let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("bad `{key}` value in debug body: {body:?}"))
+    };
+    (pick("searches"), pick("downloads"))
+}
+
 async fn search_count(base: &str) -> usize {
-    let body = reqwest_get(&format!("{base}/debug/searches")).await;
-    body.split(':').nth(1).and_then(|s| {
-        s.trim_end_matches('}').trim().parse().ok()
-    }).unwrap_or(usize::MAX)
+    counts(base).await.0
 }
 
 /// Minimal GET so the test does not need an HTTP client dependency.
@@ -480,6 +501,51 @@ async fn reqwest_get(url: &str) -> String {
     tokio::io::AsyncReadExt::read_to_end(&mut sock, &mut buf).await.unwrap();
     let text = String::from_utf8_lossy(&buf).to_string();
     text.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_completed_run_asks_gopro_for_nothing() {
+    // Resuming used to cost one /media/{id}/download call per item just to
+    // learn the file was already on disk — the whole library, every time.
+    let base = spawn_api(Mode::Normal).await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path();
+
+    let out = run_sync(&base, dest);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (searches, downloads) = counts(&base).await;
+    assert!(downloads >= 2, "first run must fetch links for both items");
+
+    let out2 = run_sync(&base, dest);
+    let stderr2 = String::from_utf8_lossy(&out2.stderr).to_string();
+    let stdout2 = String::from_utf8_lossy(&out2.stdout).to_string();
+    assert!(out2.status.success(), "{stderr2}");
+
+    assert_eq!(
+        counts(&base).await,
+        (searches, downloads),
+        "a completed re-run must make no further API calls; stderr:\n{stderr2}"
+    );
+    assert!(
+        stderr2.contains("already complete on disk"),
+        "should say why there was nothing to do, got:\n{stderr2}"
+    );
+    assert!(stdout2.contains("Downloaded 0 files"), "got:\n{stdout2}");
+
+    // Deleting a file must reopen exactly that item.
+    std::fs::remove_file(dest.join("2023/2023-07-14/GOPR0001.JPG")).unwrap();
+    let out3 = run_sync(&base, dest);
+    assert!(out3.status.success());
+    let (_, after) = counts(&base).await;
+    assert_eq!(
+        after,
+        downloads + 1,
+        "only the missing item should be re-fetched"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("2023/2023-07-14/GOPR0001.JPG")).unwrap(),
+        body_for(ITEM_A)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

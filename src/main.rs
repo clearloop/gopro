@@ -496,9 +496,6 @@ async fn cmd_sync(creds_path: &std::path::Path, args: SyncArgs) -> Result<()> {
     if args.newest_first {
         items.reverse();
     }
-    if let Some(limit) = args.limit {
-        items.truncate(limit);
-    }
 
     let mut manifest_init = Manifest::load(&args.dest)?;
     manifest_init.library_items = Some(library_size as u64);
@@ -510,6 +507,34 @@ async fn cmd_sync(creds_path: &std::path::Path, args: SyncArgs) -> Result<()> {
         }
         manifest_init.library_bytes = u.total_storage;
     }
+
+    // Decide what is left to do *before* touching the network. Asking GoPro for
+    // download links only to find the file already on disk costs one request
+    // per item, which on a resumed run is the entire library.
+    let profile = profile_of(&args);
+    let already_done = {
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(ProgressStyle::with_template("{spinner} {msg}").unwrap());
+        spinner.enable_steady_tick(std::time::Duration::from_millis(120));
+        spinner.set_message("checking what is already on disk…");
+        let before = items.len();
+        items.retain(|i| !manifest_init.item_complete(&args.dest, &i.id, &profile));
+        spinner.finish_and_clear();
+        before - items.len()
+    };
+    if already_done > 0 {
+        info!(
+            "{already_done} item(s) already complete on disk; {} left to fetch",
+            items.len()
+        );
+    }
+
+    // Applied last, so `--limit 20` means twenty items of actual work rather
+    // than twenty items that may all turn out to be done already.
+    if let Some(limit) = args.limit {
+        items.truncate(limit);
+    }
+
     let manifest = Arc::new(Mutex::new(manifest_init));
 
     if unprocessed > 0 {
@@ -520,25 +545,14 @@ async fn cmd_sync(creds_path: &std::path::Path, args: SyncArgs) -> Result<()> {
     }
 
     if args.dry_run {
-        let known: HashSet<String> = manifest
-            .lock()
-            .await
-            .entries
-            .values()
-            .map(|e| e.media_id.clone())
-            .collect();
-        let (mut pending, mut pending_bytes, mut have) = (0usize, 0u64, 0usize);
-        for i in &items {
-            if known.contains(&i.id) {
-                have += 1;
-            } else {
-                pending += 1;
-                pending_bytes += i.size().unwrap_or(0);
-            }
-        }
-        println!("{} items match the filters", items.len());
-        println!("  already recorded: {have}");
-        println!("  to download:      {pending}  (~{} reported by GoPro)", human_bytes(pending_bytes));
+        let pending_bytes: u64 = items.iter().filter_map(|i| i.size()).sum();
+        println!("{} items match the filters", items.len() + already_done);
+        println!("  already complete: {already_done}");
+        println!(
+            "  to download:      {}  (~{} reported by GoPro)",
+            items.len(),
+            human_bytes(pending_bytes)
+        );
         println!("  destination:      {}", args.dest.display());
         let partials = manifest::partials(&args.dest);
         if !partials.is_empty() {
@@ -573,15 +587,8 @@ async fn cmd_sync(creds_path: &std::path::Path, args: SyncArgs) -> Result<()> {
     // GoPro reports a size per item in the search results, so we can show a real
     // byte total and ETA rather than a bare spinner. It is an estimate: it counts
     // one rendition per item, and items already on disk are excluded.
-    let pending_bytes: u64 = {
-        let m = manifest.lock().await;
-        let done: HashSet<&str> = m.entries.values().map(|e| e.media_id.as_str()).collect();
-        items
-            .iter()
-            .filter(|i| !done.contains(i.id.as_str()))
-            .filter_map(|i| i.size())
-            .sum()
-    };
+    // `items` already excludes everything on disk, so this is the work left.
+    let pending_bytes: u64 = items.iter().filter_map(|i| i.size()).sum();
 
     let multi = MultiProgress::new();
     let _ = PROGRESS.set(multi.clone());
@@ -703,10 +710,10 @@ async fn cmd_sync(creds_path: &std::path::Path, args: SyncArgs) -> Result<()> {
 
     let failures = failures.lock().await;
     println!(
-        "\nDownloaded {} files ({}) this run; skipped {} already present.",
+        "\nDownloaded {} files ({}) this run; {} item(s) were already complete.",
         files_total.load(Ordering::SeqCst),
         human_bytes(bytes_total.load(Ordering::SeqCst)),
-        skipped.load(Ordering::SeqCst)
+        already_done + skipped.load(Ordering::SeqCst) as usize
     );
     {
         let m = manifest.lock().await;
@@ -930,6 +937,8 @@ async fn sync_one(
             if opts.metadata {
                 write_metadata(dest, item, planned)?;
             }
+            // Only now, with every planned asset on disk, is the item finished.
+            manifest.lock().await.mark_complete(&item.id, &profile_of(opts));
             return Ok(());
         }
         tokio::time::sleep(backoff(attempt)).await;
@@ -941,6 +950,16 @@ async fn sync_one(
 /// How many back-to-back item failures before we conclude the problem is not
 /// per-item and stop.
 const CONSECUTIVE_FAILURE_LIMIT: u64 = 12;
+
+/// Identifies the set of assets a run asks for, so a later run can tell
+/// "nothing left to do" from "you changed the flags, look again".
+fn profile_of(args: &SyncArgs) -> String {
+    let mut p = args.variant.as_str().to_string();
+    if args.sidecars {
+        p.push_str("+sidecars");
+    }
+    p
+}
 
 fn backoff(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis((500u64 << attempt.min(6)).min(30_000))
