@@ -28,11 +28,19 @@ enum Mode {
     TruncateFirst,
     /// Dribble the body out so a run can be interrupted mid-file.
     Slow,
+    /// Reject anything that does not carry the `gp_access_token` cookie, the
+    /// way GoPro's web session actually authenticates.
+    RequireCookie,
+    /// Serve a large library whose every asset 500s, to exercise the
+    /// give-up-early path.
+    AlwaysFail,
 }
 
 struct Fake {
     /// CDN paths already served once.
     served: Mutex<HashSet<String>>,
+    /// How many times the client walked the media listing.
+    searches: Mutex<usize>,
     mode: Mode,
 }
 
@@ -40,7 +48,11 @@ async fn spawn_api(mode: Mode) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let base = format!("http://{addr}");
-    let state = Arc::new(Fake { served: Mutex::new(HashSet::new()), mode });
+    let state = Arc::new(Fake {
+        served: Mutex::new(HashSet::new()),
+        searches: Mutex::new(0),
+        mode,
+    });
     let base_for_handler = base.clone();
 
     tokio::spawn(async move {
@@ -58,6 +70,7 @@ async fn spawn_api(mode: Mode) -> String {
                 let path = request_line.split_whitespace().nth(1).unwrap_or("/").to_string();
 
                 let mut range_start = 0usize;
+                let mut has_cookie = false;
                 loop {
                     let mut line = String::new();
                     if rd.read_line(&mut line).await.unwrap_or(0) == 0 || line == "\r\n" {
@@ -67,15 +80,44 @@ async fn spawn_api(mode: Mode) -> String {
                     if let Some(rest) = lower.strip_prefix("range: bytes=") {
                         range_start = rest.trim().trim_end_matches('-').parse().unwrap_or(0);
                     }
+                    if lower.starts_with("cookie:") && lower.contains("gp_access_token=test-token") {
+                        has_cookie = true;
+                    }
                 }
 
-                if path.starts_with("/media/search") {
+                // Signed CDN links carry their own auth, so only the API is gated.
+                if state.mode == Mode::RequireCookie && !has_cookie && !path.starts_with("/cdn/") {
+                    let _ = wr
+                        .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
+
+                if path == "/debug/searches" {
+                    let n = *state.searches.lock().unwrap();
+                    let _ = write_json(&mut wr, &format!("{{\"searches\":{n}}}")).await;
+                } else if path == "/media/user" {
+                    let n = if state.mode == Mode::AlwaysFail { 30 } else { 2 };
+                    let _ = write_json(
+                        &mut wr,
+                        &format!(
+                            "{{\"id\":\"acct-test\",\"total_count\":{n},\"total_storage\":400000}}"
+                        ),
+                    )
+                    .await;
+                } else if path.starts_with("/media/search") {
+                    *state.searches.lock().unwrap() += 1;
                     let page = query_value(&path, "page").unwrap_or_else(|| "1".into());
-                    let json = if page == "1" { search_page() } else { empty_page() };
+                    let n = if state.mode == Mode::AlwaysFail { 30 } else { 2 };
+                    let json = if page == "1" { search_page(n) } else { empty_page() };
                     let _ = write_json(&mut wr, &json).await;
                 } else if path.starts_with("/media/") && path.ends_with("/download") {
                     let id = path.trim_start_matches("/media/").trim_end_matches("/download");
                     let _ = write_json(&mut wr, &download_json(&base, id)).await;
+                } else if state.mode == Mode::AlwaysFail && path.starts_with("/cdn/") {
+                    let _ = wr
+                        .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                        .await;
                 } else if let Some(id) = path.strip_prefix("/cdn/").map(|p| {
                     p.split('/').next().unwrap_or_default().to_string()
                 }) {
@@ -138,14 +180,33 @@ async fn write_json(wr: &mut tokio::net::tcp::OwnedWriteHalf, json: &str) -> std
     wr.write_all(json.as_bytes()).await
 }
 
-fn search_page() -> String {
+fn search_page(n: usize) -> String {
+    // Two items sharing a filename by design; the rest are filler used by the
+    // give-up-early test.
+    let mut media = vec![
+        format!(
+            r#"{{"id":"{ITEM_A}","filename":"GOPR0001.JPG","file_extension":"JPG",
+                "captured_at":"2023-07-14T09:30:00Z","file_size":200000,"type":"Photo",
+                "ready_to_view":"ready"}}"#
+        ),
+        format!(
+            r#"{{"id":"{ITEM_B}","filename":"GOPR0001.JPG","file_extension":"JPG",
+                "captured_at":"2023-07-14T11:00:00Z","file_size":"200000","type":"Photo",
+                "ready_to_view":"ready"}}"#
+        ),
+    ];
+    for i in 2..n {
+        media.push(format!(
+            r#"{{"id":"id{i:04}","filename":"GOPR{i:04}.JPG","file_extension":"JPG",
+                "captured_at":"2023-07-15T09:00:00Z","file_size":200000,"type":"Photo",
+                "ready_to_view":"ready"}}"#
+        ));
+    }
     format!(
-        r#"{{"_embedded":{{"media":[
-            {{"id":"{ITEM_A}","filename":"GOPR0001.JPG","file_extension":"JPG",
-              "captured_at":"2023-07-14T09:30:00Z","file_size":200000,"type":"Photo"}},
-            {{"id":"{ITEM_B}","filename":"GOPR0001.JPG","file_extension":"JPG",
-              "captured_at":"2023-07-14T11:00:00Z","file_size":"200000","type":"Photo"}}
-        ]}},"_pages":{{"current_page":1,"per_page":100,"total_items":2,"total_pages":1}}}}"#
+        r#"{{"_embedded":{{"media":[{}]}},"_pages":{{"current_page":1,"per_page":100,
+           "total_items":{},"total_pages":1}}}}"#,
+        media.join(","),
+        media.len()
     )
 }
 
@@ -206,7 +267,7 @@ async fn interrupted_transfers_resume_and_a_second_run_is_a_noop() {
         "second run should download nothing, got:\n{stdout2}"
     );
     assert!(
-        stdout2.contains("Archived 2/2 items"),
+        stdout2.contains("Items:     2/2 archived"),
         "second run should report full coverage, got:\n{stdout2}"
     );
 
@@ -231,7 +292,7 @@ async fn a_stale_partial_from_a_killed_run_is_resumed_not_restarted() {
     // Simulate a hard kill: half of item A already staged under its own key.
     let parts = dest.join(".gopro-dl/parts");
     std::fs::create_dir_all(&parts).unwrap();
-    let staged = parts.join(format!("{ITEM_A}__source_0.part"));
+    let staged = parts.join(format!("{ITEM_A}__original_0.part"));
     let full = body_for(ITEM_A);
     std::fs::write(&staged, &full[..full.len() / 2]).unwrap();
 
@@ -307,7 +368,160 @@ async fn ctrl_c_stops_cleanly_and_the_next_run_finishes_the_job() {
     let out3 = run_sync(&fast, dest);
     let stdout3 = String::from_utf8_lossy(&out3.stdout).to_string();
     assert!(stdout3.contains("Downloaded 0 files"), "got:\n{stdout3}");
-    assert!(stdout3.contains("Archived 2/2 items"), "got:\n{stdout3}");
+    assert!(stdout3.contains("Items:     2/2 archived"), "got:\n{stdout3}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cookie_only_session_authenticates() {
+    // GoPro's web app sends no Authorization header — the token lives in a
+    // gp_access_token cookie — so the client must present it that way too.
+    let base = spawn_api(Mode::RequireCookie).await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path();
+
+    let out = run_sync(&base, dest);
+    assert!(
+        out.status.success(),
+        "cookie auth failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let a = dest.join("2023/2023-07-14/GOPR0001.JPG");
+    assert!(a.exists(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read(&a).unwrap(), body_for(ITEM_A));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unwritable_destination_fails_before_listing_anything() {
+    // Exactly what an external disk does when macOS has not granted the
+    // terminal access to removable volumes.
+    let base = spawn_api(Mode::Normal).await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("archive");
+    std::fs::create_dir_all(&dest).unwrap();
+    let mut perms = std::fs::metadata(&dest).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o555);
+    }
+    std::fs::set_permissions(&dest, perms).unwrap();
+
+    let started = std::time::Instant::now();
+    let out = run_sync(&base, &dest);
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(!out.status.success(), "should exit non-zero, got:\n{stderr}");
+    assert!(
+        stderr.contains("cannot write to"),
+        "should name the write failure, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Removable Volumes"),
+        "should say how to fix it, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("found") && !stderr.contains("listing media"),
+        "must fail before listing the library, got:\n{stderr}"
+    );
+    assert!(elapsed.as_secs() < 10, "should fail fast, took {elapsed:?}");
+
+    // Leave the dir removable by tempfile's cleanup.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = std::fs::metadata(&dest).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&dest, p).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_that_fails_every_item_gives_up_instead_of_grinding_on() {
+    let base = spawn_api(Mode::AlwaysFail).await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_gopro-dl"))
+        .args(["sync", "--dest", dest.to_str().unwrap(), "--jobs", "1", "--retries", "1"])
+        .env("GOPRO_API_BASE", &base)
+        .env("GOPRO_ACCESS_TOKEN", "test-token")
+        .output()
+        .expect("run gopro-dl");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "should exit non-zero");
+    assert!(
+        stdout.contains("failed in a row") || stderr.contains("failed in a row"),
+        "should explain why it stopped, got:\n{stdout}\n{stderr}"
+    );
+    // 30 items were offered; it must not have attempted anywhere near all of them.
+    let attempted = stderr.matches("failed:").count();
+    assert!(attempted < 25, "gave up too late: {attempted} attempts");
+}
+
+async fn search_count(base: &str) -> usize {
+    let body = reqwest_get(&format!("{base}/debug/searches")).await;
+    body.split(':').nth(1).and_then(|s| {
+        s.trim_end_matches('}').trim().parse().ok()
+    }).unwrap_or(usize::MAX)
+}
+
+/// Minimal GET so the test does not need an HTTP client dependency.
+async fn reqwest_get(url: &str) -> String {
+    let rest = url.trim_start_matches("http://");
+    let (host, path) = rest.split_once('/').unwrap();
+    let mut sock = tokio::net::TcpStream::connect(host).await.unwrap();
+    let req = format!("GET /{path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    sock.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut sock, &mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf).to_string();
+    text.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_run_reuses_the_cached_listing() {
+    let base = spawn_api(Mode::Normal).await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path();
+
+    let out = run_sync(&base, dest);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let after_first = search_count(&base).await;
+    assert!(after_first >= 1, "first run must walk the listing");
+    assert!(dest.join(".gopro-dl/library.json").exists(), "cache should be written");
+
+    // Nothing about the library changed, so the listing must not be walked again.
+    let out2 = run_sync(&base, dest);
+    let stderr2 = String::from_utf8_lossy(&out2.stderr).to_string();
+    assert!(out2.status.success(), "{stderr2}");
+    assert_eq!(
+        search_count(&base).await,
+        after_first,
+        "second run re-walked the listing; stderr:\n{stderr2}"
+    );
+    assert!(
+        stderr2.contains("using cached listing"),
+        "should say it used the cache, got:\n{stderr2}"
+    );
+
+    // --refresh-list overrides it.
+    let out3 = Command::new(env!("CARGO_BIN_EXE_gopro-dl"))
+        .args([
+            "sync", "--dest", dest.to_str().unwrap(), "--jobs", "1", "--refresh-list",
+        ])
+        .env("GOPRO_API_BASE", &base)
+        .env("GOPRO_ACCESS_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(out3.status.success());
+    assert!(
+        search_count(&base).await > after_first,
+        "--refresh-list should force a re-walk"
+    );
 }
 
 fn gopro_dl_partials(dest: &Path) -> Vec<std::path::PathBuf> {

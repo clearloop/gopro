@@ -30,10 +30,12 @@ pub struct Manifest {
     pub version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sync: Option<DateTime<Utc>>,
-    /// How many items the cloud library held at the last successful listing.
-    /// Lets `stats` report "x of y archived" without hitting the network.
+    /// What the cloud library held at the last successful listing, so `stats`
+    /// can report progress — in items *and* bytes — without hitting the network.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub library_items: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_bytes: Option<u64>,
     /// Keyed by `{media_id}::{asset_key}` — one media item can yield several
     /// files (chapters, bursts, sidecars).
     pub entries: BTreeMap<String, Entry>,
@@ -41,7 +43,13 @@ pub struct Manifest {
 
 impl Default for Manifest {
     fn default() -> Self {
-        Self { version: 1, last_sync: None, library_items: None, entries: BTreeMap::new() }
+        Self {
+            version: 1,
+            last_sync: None,
+            library_items: None,
+            library_bytes: None,
+            entries: BTreeMap::new(),
+        }
     }
 }
 

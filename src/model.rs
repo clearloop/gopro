@@ -112,11 +112,13 @@ pub struct DownloadResponse {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DownloadEmbedded {
-    /// Camera-original files. Chaptered videos and burst/timelapse groups have
-    /// more than one entry, distinguished by `item_number`.
+    /// Despite the name, this is *not* the camera original for a processed
+    /// item — for a ready video it points at the 720p `edit_proxy`. It only
+    /// carries the original for items GoPro has not transcoded yet.
     #[serde(default)]
     pub files: Vec<Asset>,
-    /// Cloud-side transcodes (`mp4_low`, `concat`, ...).
+    /// Where the real original lives, labelled `source` (or `baked_source` for
+    /// a MultiClipEdit), alongside proxies like `edit_proxy` and `audio_proxy`.
     #[serde(default)]
     pub variations: Vec<Asset>,
     /// LRV / THM / GPMF companions when the account has them.
@@ -141,9 +143,17 @@ pub struct Asset {
     pub height: Option<serde_json::Value>,
     #[serde(default)]
     pub file_extension: Option<String>,
+    /// False while an item is still uploading or transcoding; the signed URL
+    /// exists but the CDN answers 403.
+    #[serde(default)]
+    pub available: Option<bool>,
 }
 
 impl Asset {
+    pub fn is_usable(&self) -> bool {
+        self.available != Some(false)
+    }
+
     pub fn pixels(&self) -> u64 {
         let w = loose_u64(&self.width).unwrap_or(0);
         let h = loose_u64(&self.height).unwrap_or(0);
@@ -151,11 +161,40 @@ impl Asset {
     }
 
     /// Stable-ish tag used to key manifest entries and to disambiguate names.
+    ///
+    /// Entries under `_embedded.files` carry no label, but their CDN path spells
+    /// out the rendition (`…/edit_proxy/default/1.mp4`), so fall back to that
+    /// rather than labelling everything "asset".
     pub fn tag(&self) -> String {
         self.label
             .clone()
             .or_else(|| self.quality.clone())
+            .or_else(|| self.rendition_from_url())
             .or_else(|| self.kind.clone())
             .unwrap_or_else(|| "asset".to_string())
     }
+
+    /// `https://…/<media>/<rendition>/<position>/<n>.mp4` → `<rendition>`.
+    fn rendition_from_url(&self) -> Option<String> {
+        let path = self.url.split('?').next()?;
+        let segments: Vec<&str> = path.split('/').collect();
+        let name = segments.iter().rev().nth(2)?;
+        if name.is_empty() || name.len() > 40 {
+            return None;
+        }
+        Some((*name).to_string())
+    }
+}
+
+/// `GET /media/user` — account-wide counts and byte totals.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaUser {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub total_count: Option<u64>,
+    #[serde(default)]
+    pub total_storage: Option<u64>,
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
