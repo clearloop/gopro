@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use crate::auth::{self, Credentials};
-use crate::model::{DownloadResponse, MediaSearchResponse};
+use crate::model::{DownloadResponse, MediaSearchResponse, MediaUser};
 
 const DEFAULT_API_BASE: &str = "https://api.gopro.com";
 
@@ -87,6 +87,9 @@ impl Api {
                 .http
                 .get(url)
                 .bearer_auth(&token)
+                // The web app authenticates by cookie, and some endpoints only
+                // honour that. Sending both costs nothing and covers either.
+                .header(reqwest::header::COOKIE, format!("gp_access_token={token}"))
                 .header(reqwest::header::ACCEPT, "application/vnd.gopro.jk.media+json; version=2.0.0")
                 .header("Accept-Charset", "utf-8")
                 .header("Origin", "https://plus.gopro.com")
@@ -135,7 +138,18 @@ impl Api {
                 bail!("GET {url} -> {status}: {}", truncate(&body, 400));
             }
 
-            let body = resp.bytes().await?;
+            // Reading the body can time out just like connecting can, and on a
+            // multi-hour archive run that must not abort everything.
+            let body = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) if attempt < self.retries => {
+                    warn!("GET {url}: body read failed ({e}); retry {attempt}/{}", self.retries);
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(30));
+                    continue;
+                }
+                Err(e) => return Err(e).with_context(|| format!("reading body of {url}")),
+            };
             return serde_json::from_slice(&body).with_context(|| {
                 format!(
                     "could not parse response from {url}: {}",
@@ -164,9 +178,12 @@ impl Api {
         self.get_json(&url).await
     }
 
-    pub async fn user(&self) -> Result<serde_json::Value> {
-        self.get_json(&format!("{}/v1/user", api_base())).await
+    /// Account summary. Note this is `/media/user`, not `/v1/user` — the
+    /// latter 404s.
+    pub async fn media_user(&self) -> Result<MediaUser> {
+        self.get_json(&format!("{}/media/user", api_base())).await
     }
+
 }
 
 fn retry_after(resp: &reqwest::Response) -> Option<Duration> {

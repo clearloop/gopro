@@ -7,15 +7,29 @@ use std::path::PathBuf;
 
 use crate::model::{Asset, DownloadResponse, MediaItem};
 
+/// Labels GoPro uses for the untouched upload. `source` is a camera file;
+/// `baked_source` is the rendered output of a MultiClipEdit project.
+const ORIGINAL_LABELS: [&str; 2] = ["source", "baked_source"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Variant {
     /// Camera originals only. What you want for an archive.
     Source,
-    /// Originals, plus the highest-resolution cloud transcode when no original
-    /// is offered (older uploads sometimes only expose variations).
+    /// Originals, plus the highest-resolution proxy for items that expose no
+    /// original at all.
     Best,
     /// Everything GoPro will hand over, including low-res proxies.
     All,
+}
+
+impl Variant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Variant::Source => "source",
+            Variant::Best => "best",
+            Variant::All => "all",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -59,6 +73,28 @@ fn split_name(name: &str) -> (String, String) {
             (stem.to_string(), ext.to_string())
         }
         _ => (name.to_string(), String::new()),
+    }
+}
+
+/// The extension an original should actually carry.
+///
+/// Normally the item's own filename is right (`GX012169.MP4`). But a
+/// MultiClipEdit reports `file_extension: "json"` — that is the edit *project* —
+/// while the downloadable asset is the rendered `mp4`. Trust the asset when the
+/// two genuinely disagree, and keep the item's casing when they do not.
+fn original_ext(asset: &Asset, from_url: &Option<String>, base_ext: &str) -> String {
+    let asset_ext = asset
+        .file_extension
+        .clone()
+        .filter(|e| !e.is_empty())
+        .or_else(|| from_url.as_deref().map(|n| split_name(n).1))
+        .filter(|e| !e.is_empty())
+        .or_else(|| asset.kind.clone())
+        .filter(|e| !e.is_empty());
+
+    match asset_ext {
+        Some(e) if base_ext.is_empty() || !base_ext.eq_ignore_ascii_case(&e) => e,
+        _ => base_ext.to_string(),
     }
 }
 
@@ -124,28 +160,62 @@ fn dir_for(item: &MediaItem, layout: Layout) -> PathBuf {
     }
 }
 
-/// Pick the assets to fetch for one item, in a stable order.
+/// Pick the assets to fetch for one item, in a stable order. The bool marks an
+/// asset as an original, which controls naming (originals keep the camera
+/// filename; everything else gets a `-<rendition>` suffix).
+///
+/// The subtle part: `_embedded.files` is *not* the original for a processed
+/// item. GoPro serves the 720p `edit_proxy` there and puts the real camera file
+/// in `_embedded.variations` under the `source` label — same pixel dimensions in
+/// the metadata, ~20x smaller on the wire. Preferring `files` silently archives
+/// proxies, so originals are resolved from the labelled variations first and
+/// `files` is only a fallback for items GoPro has not transcoded yet.
 fn select(dl: &DownloadResponse, variant: Variant, sidecars: bool) -> Vec<(&Asset, bool)> {
-    let mut out: Vec<(&Asset, bool)> = Vec::new();
-    for f in &dl.embedded.files {
-        out.push((f, true));
-    }
+    let labelled: Vec<&Asset> = dl
+        .embedded
+        .variations
+        .iter()
+        .filter(|v| {
+            v.label
+                .as_deref()
+                .is_some_and(|l| ORIGINAL_LABELS.contains(&l))
+                && v.is_usable()
+        })
+        .collect();
+
+    let files_are_original = labelled.is_empty();
+    let originals: Vec<&Asset> = if files_are_original {
+        dl.embedded.files.iter().filter(|f| f.is_usable()).collect()
+    } else {
+        labelled
+    };
+
+    let mut out: Vec<(&Asset, bool)> = originals.iter().map(|a| (*a, true)).collect();
 
     match variant {
         Variant::Source => {}
         Variant::All => {
             for v in &dl.embedded.variations {
-                out.push((v, false));
+                if !originals.iter().any(|o| std::ptr::eq(*o, v)) && v.is_usable() {
+                    out.push((v, false));
+                }
+            }
+            if !files_are_original {
+                for f in dl.embedded.files.iter().filter(|f| f.is_usable()) {
+                    out.push((f, false));
+                }
             }
         }
         Variant::Best => {
             if out.is_empty() {
-                if let Some(best) = dl
+                let fallback = dl
                     .embedded
                     .variations
                     .iter()
-                    .max_by_key(|v| (v.pixels(), v.tag()))
-                {
+                    .chain(dl.embedded.files.iter())
+                    .filter(|a| a.is_usable())
+                    .max_by_key(|v| (v.pixels(), v.tag()));
+                if let Some(best) = fallback {
                     out.push((best, false));
                 }
             }
@@ -153,7 +223,7 @@ fn select(dl: &DownloadResponse, variant: Variant, sidecars: bool) -> Vec<(&Asse
     }
 
     if sidecars {
-        for s in &dl.embedded.sidecar_files {
+        for s in dl.embedded.sidecar_files.iter().filter(|s| s.is_usable()) {
             out.push((s, false));
         }
     }
@@ -161,9 +231,9 @@ fn select(dl: &DownloadResponse, variant: Variant, sidecars: bool) -> Vec<(&Asse
 }
 
 /// Stable identity for one downloadable asset within a media item.
-fn asset_key(asset: &Asset, is_source: bool) -> String {
-    if is_source {
-        format!("source:{}", asset.item_number.unwrap_or(0))
+fn asset_key(asset: &Asset, is_original: bool) -> String {
+    if is_original {
+        format!("original:{}", asset.item_number.unwrap_or(0))
     } else {
         format!("{}:{}", asset.tag(), asset.item_number.unwrap_or(0))
     }
@@ -202,7 +272,14 @@ pub fn plan_item(
     claimed: &mut HashSet<PathBuf>,
     recorded: &HashMap<String, PathBuf>,
 ) -> Vec<PlannedAsset> {
-    let base = sanitize(dl.filename.as_deref().unwrap_or(&item.display_name()));
+    // MultiClipEdit items carry `filename: ""` here and in the search results,
+    // so an empty string must fall through, not sanitize to "unnamed".
+    let base = sanitize(
+        dl.filename
+            .as_deref()
+            .filter(|f| !f.trim().is_empty())
+            .unwrap_or(&item.display_name()),
+    );
     let (base_stem, base_ext) = split_name(&base);
     let dir = dir_for(item, layout);
 
@@ -219,9 +296,9 @@ pub fn plan_item(
                 (true, Some(n)) => n.to_string(),
                 (true, None) => {
                     let n = asset.item_number.unwrap_or(0);
-                    join_name(&format!("{base_stem}-{n:03}"), &base_ext)
+                    join_name(&format!("{base_stem}-{n:03}"), &original_ext(asset, &from_url, &base_ext))
                 }
-                (false, _) => base.clone(),
+                (false, _) => join_name(&base_stem, &original_ext(asset, &from_url, &base_ext)),
             }
         } else {
             let ext = asset
@@ -229,6 +306,9 @@ pub fn plan_item(
                 .clone()
                 .filter(|e| !e.is_empty())
                 .or_else(|| from_url.as_deref().map(|n| split_name(n).1))
+                .filter(|e| !e.is_empty())
+                // Variations report their container in `type` (`mp4`, `m4a`).
+                .or_else(|| asset.kind.clone())
                 .filter(|e| !e.is_empty())
                 .unwrap_or_else(|| base_ext.clone());
             let suffix = sanitize(&asset.tag());
@@ -312,7 +392,7 @@ mod tests {
         let p = plan_item(&it, &d, Variant::Source, Layout::Date, false, &mut claimed, &HashMap::new());
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].rel_path, PathBuf::from("2023/2023-07-14/GX010123.MP4"));
-        assert_eq!(p[0].asset_key, "source:0");
+        assert_eq!(p[0].asset_key, "original:0");
     }
 
     #[test]
@@ -331,7 +411,7 @@ mod tests {
         let p = plan_item(&it, &d, Variant::Source, Layout::Flat, false, &mut claimed, &HashMap::new());
         let names: Vec<_> = p.iter().map(|a| a.rel_path.to_string_lossy().to_string()).collect();
         assert_eq!(names, vec!["GX010123.MP4", "GX020123.MP4"]);
-        assert_eq!(p[1].asset_key, "source:2");
+        assert_eq!(p[1].asset_key, "original:2");
     }
 
     #[test]
@@ -408,7 +488,7 @@ mod tests {
             "_embedded": { "files": [{ "url": "https://cdn/x/GX010123.MP4?s=1" }] }
         }));
         let recorded = HashMap::from([(
-            "source:0".to_string(),
+            "original:0".to_string(),
             PathBuf::from("2023/2023-07-14/GX010123-abc.MP4"),
         )]);
         let mut claimed = HashSet::new();
@@ -434,7 +514,7 @@ mod tests {
         // Run 1 finished A only; the manifest now claims the bare name for A.
         let mut claimed = HashSet::from([PathBuf::from("2023/2023-07-14/GOPR0001.JPG")]);
         let a_recorded = HashMap::from([(
-            "source:0".to_string(),
+            "original:0".to_string(),
             PathBuf::from("2023/2023-07-14/GOPR0001.JPG"),
         )]);
 
@@ -469,5 +549,156 @@ mod tests {
         for a in &planned {
             assert_eq!(urls.get(&a.asset_key).map(String::as_str), Some(a.url.as_str()));
         }
+    }
+
+    /// The exact shape a live GoPro account returns for a processed video:
+    /// `files` holds the 720p edit proxy, and the camera original is the
+    /// `source` variation. Preferring `files` silently archives proxies.
+    fn real_ready_video() -> DownloadResponse {
+        dl(serde_json::json!({
+            "filename": "GX012166.MP4",
+            "_embedded": {
+                "files": [{
+                    "url": "https://cdn.gopro.com/abc/def/edit_proxy/default/1.mp4?sig=1",
+                    "camera_position": "default", "item_number": 1,
+                    "width": 1280, "height": 720, "video_codec": "hevc", "available": true
+                }],
+                "variations": [
+                    { "url": "https://cdn.gopro.com/abc/def/edit_proxy/default/1.mp4?sig=1",
+                      "label": "edit_proxy", "type": "mp4", "quality": "720p",
+                      "width": 1280, "height": 720, "available": true },
+                    { "url": "https://cdn.gopro.com/abc/def/audio_proxy/default/1.m4a?sig=1",
+                      "label": "audio_proxy", "type": "m4a", "quality": "0p",
+                      "width": 0, "height": 0, "available": true },
+                    { "url": "https://cdn.gopro.com/abc/def/source/default/1.mp4?sig=1",
+                      "label": "source", "type": "mp4", "quality": "2988p",
+                      "width": 5312, "height": 2988, "available": true }
+                ]
+            }
+        }))
+    }
+
+    #[test]
+    fn the_original_is_the_source_variation_not_the_files_entry() {
+        let it = item(serde_json::json!({
+            "id": "abc", "filename": "GX012166.MP4", "file_size": 102675568,
+            "captured_at": "2026-01-18T08:07:42Z"
+        }));
+        let mut claimed = HashSet::new();
+        let p = plan_item(&it, &real_ready_video(), Variant::Source, Layout::Flat,
+                          false, &mut claimed, &HashMap::new());
+
+        assert_eq!(p.len(), 1, "exactly one original, got {p:?}");
+        assert!(p[0].url.contains("/source/"), "must be the source rendition: {}", p[0].url);
+        assert!(!p[0].url.contains("edit_proxy"), "must not be the 720p proxy");
+        assert_eq!(p[0].rel_path, PathBuf::from("GX012166.MP4"));
+    }
+
+    #[test]
+    fn best_also_resolves_to_the_source_variation() {
+        let it = item(serde_json::json!({ "id": "abc", "filename": "GX012166.MP4" }));
+        let mut claimed = HashSet::new();
+        let p = plan_item(&it, &real_ready_video(), Variant::Best, Layout::Flat,
+                          false, &mut claimed, &HashMap::new());
+        assert_eq!(p.len(), 1);
+        assert!(p[0].url.contains("/source/"));
+    }
+
+    #[test]
+    fn all_adds_proxies_under_suffixed_names_without_duplicating_the_original() {
+        let it = item(serde_json::json!({ "id": "abc", "filename": "GX012166.MP4" }));
+        let mut claimed = HashSet::new();
+        let p = plan_item(&it, &real_ready_video(), Variant::All, Layout::Flat,
+                          false, &mut claimed, &HashMap::new());
+
+        let names: Vec<String> =
+            p.iter().map(|a| a.rel_path.to_string_lossy().to_string()).collect();
+        assert!(names.contains(&"GX012166.MP4".to_string()), "{names:?}");
+        assert!(names.contains(&"GX012166-edit_proxy.mp4".to_string()), "{names:?}");
+        assert!(names.contains(&"GX012166-audio_proxy.m4a".to_string()), "{names:?}");
+        // The `files` entry is the same rendition as `edit_proxy`; it must not
+        // land twice under two different names.
+        assert_eq!(names.len(), names.iter().collect::<HashSet<_>>().len(), "dupes: {names:?}");
+    }
+
+    #[test]
+    fn a_multi_clip_edit_uses_its_baked_source() {
+        let it = item(serde_json::json!({
+            "id": "mce1", "filename": "edit.json", "type": "MultiClipEdit"
+        }));
+        let d = dl(serde_json::json!({
+            "filename": "MyEdit.mp4",
+            "_embedded": {
+                "files": [{ "url": "https://cdn/x/proxy/default/1.mp4?s=1", "available": true }],
+                "variations": [{ "url": "https://cdn/x/baked_source/default/1.mp4?s=1",
+                                 "label": "baked_source", "type": "mp4", "available": true }],
+                "sidecar_files": [{ "url": "https://cdn/x/edl/1.json?s=1", "label": "edl_mce" }]
+            }
+        }));
+        let mut claimed = HashSet::new();
+        let p = plan_item(&it, &d, Variant::Source, Layout::Flat, false, &mut claimed, &HashMap::new());
+        assert_eq!(p.len(), 1);
+        assert!(p[0].url.contains("baked_source"), "{}", p[0].url);
+    }
+
+    #[test]
+    fn unavailable_assets_are_skipped() {
+        // An item still uploading: the URL exists but the CDN answers 403.
+        let it = item(serde_json::json!({ "id": "abc", "filename": "GX012175.MP4" }));
+        let d = dl(serde_json::json!({
+            "filename": "GX012175.MP4",
+            "_embedded": {
+                "files": [{ "url": "https://cdn/x/source/default/1.mp4?s=1",
+                            "item_number": 1, "available": false }],
+                "variations": []
+            }
+        }));
+        let mut claimed = HashSet::new();
+        let p = plan_item(&it, &d, Variant::Source, Layout::Flat, false, &mut claimed, &HashMap::new());
+        assert!(p.is_empty(), "should not queue a 403 waiting to happen: {p:?}");
+    }
+
+    #[test]
+    fn a_multi_clip_edit_is_named_for_the_rendered_mp4_not_the_edit_project() {
+        // Live shape: filename is "", file_extension says "json" (the project),
+        // and the only downloadable original is the baked mp4.
+        let it = item(serde_json::json!({
+            "id": "69820827bc7745c3574aa2c3", "filename": "", "file_extension": "json",
+            "type": "MultiClipEdit", "captured_at": "2026-01-19T02:44:56Z"
+        }));
+        let d = dl(serde_json::json!({
+            "filename": "",
+            "_embedded": {
+                "files": [],
+                "variations": [{ "url": "https://cdn/x/baked_source/default/1.mp4?s=1",
+                                 "label": "baked_source", "type": "mp4", "available": true }],
+                "sidecar_files": [{ "url": "https://cdn/x/edl_mce/default/1.json?s=1",
+                                    "label": "edl_mce", "type": "json" }]
+            }
+        }));
+        let mut claimed = HashSet::new();
+        let p = plan_item(&it, &d, Variant::Source, Layout::Date, true, &mut claimed, &HashMap::new());
+
+        let names: Vec<String> =
+            p.iter().map(|a| a.rel_path.to_string_lossy().to_string()).collect();
+        assert!(
+            names.contains(&"2026/2026-01-19/69820827bc7745c3574aa2c3.mp4".to_string()),
+            "expected the baked mp4, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("-edl_mce.json")),
+            "expected the EDL sidecar, got {names:?}"
+        );
+        assert!(!names.iter().any(|n| n.contains("unnamed")), "got {names:?}");
+    }
+
+    #[test]
+    fn an_ordinary_video_keeps_its_own_extension_casing() {
+        let it = item(serde_json::json!({ "id": "abc", "filename": "GX012169.MP4" }));
+        let mut claimed = HashSet::new();
+        let p = plan_item(&it, &real_ready_video(), Variant::Source, Layout::Flat,
+                          false, &mut claimed, &HashMap::new());
+        // The CDN path is `.../source/default/1.mp4`; the camera name wins.
+        assert_eq!(p[0].rel_path, PathBuf::from("GX012166.MP4"));
     }
 }

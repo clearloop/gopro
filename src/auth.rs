@@ -42,6 +42,45 @@ impl Credentials {
     }
 }
 
+/// Pull an access token out of whatever the user pasted.
+///
+/// GoPro's web app carries the token in a `gp_access_token` cookie rather than
+/// an `Authorization` header, so the useful thing to accept is: a bare token, a
+/// full header line, a `name=value` cookie pair, or an entire `Cookie:` header
+/// with the token buried among other pairs.
+pub fn normalize_token(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+
+    // A whole cookie jar, or a single `gp_access_token=...` pair.
+    if let Some(idx) = raw.find("gp_access_token=") {
+        let rest = &raw[idx + "gp_access_token=".len()..];
+        let value = rest.split(&[';', ' ', ','][..]).next().unwrap_or(rest);
+        return clean(value);
+    }
+
+    let rest = strip_prefix_ci(raw, "authorization:").trim();
+    clean(strip_prefix_ci(rest, "bearer"))
+}
+
+/// `trim_start_matches` is case-sensitive and needs the exact separator; header
+/// names and the auth scheme are neither.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> &'a str {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        s[prefix.len()..].trim_start()
+    } else {
+        s
+    }
+}
+
+fn clean(s: &str) -> Option<String> {
+    let t = s.trim().trim_matches(['"', '\'']).trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
 pub fn default_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -191,4 +230,55 @@ pub async fn refresh(http: &reqwest::Client, refresh_token: &str) -> Result<Cred
         creds.refresh_token = Some(refresh_token.to_string());
     }
     Ok(creds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_token;
+
+    const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc-_123";
+
+    #[test]
+    fn accepts_a_bare_token() {
+        assert_eq!(normalize_token(JWT).as_deref(), Some(JWT));
+        assert_eq!(normalize_token(&format!("  {JWT}\n")).as_deref(), Some(JWT));
+    }
+
+    #[test]
+    fn strips_an_authorization_header() {
+        assert_eq!(normalize_token(&format!("Bearer {JWT}")).as_deref(), Some(JWT));
+        assert_eq!(
+            normalize_token(&format!("Authorization: Bearer {JWT}")).as_deref(),
+            Some(JWT)
+        );
+        assert_eq!(
+            normalize_token(&format!("authorization: bearer {JWT}")).as_deref(),
+            Some(JWT)
+        );
+    }
+
+    #[test]
+    fn extracts_the_gopro_cookie() {
+        assert_eq!(
+            normalize_token(&format!("gp_access_token={JWT}")).as_deref(),
+            Some(JWT)
+        );
+        // A whole cookie jar copied out of DevTools, token in the middle.
+        assert_eq!(
+            normalize_token(&format!("_ga=GA1.2.9; gp_access_token={JWT}; gp_user=42")).as_deref(),
+            Some(JWT)
+        );
+        assert_eq!(
+            normalize_token(&format!("Cookie: gp_access_token=\"{JWT}\"")).as_deref(),
+            Some(JWT)
+        );
+    }
+
+    #[test]
+    fn rejects_nothing_useful() {
+        assert_eq!(normalize_token(""), None);
+        assert_eq!(normalize_token("   \n "), None);
+        assert_eq!(normalize_token("Bearer "), None);
+        assert_eq!(normalize_token("gp_access_token="), None);
+    }
 }

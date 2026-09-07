@@ -2,6 +2,7 @@
 
 mod api;
 mod auth;
+mod cache;
 mod download;
 mod manifest;
 mod model;
@@ -34,7 +35,8 @@ use crate::plan::{Layout, Variant};
                   it left off using a manifest stored under <dest>/.gopro-dl/."
 )]
 struct Cli {
-    /// Where credentials live (default: ~/.config/gopro-dl/credentials.json)
+    /// Credentials file (default: <config-dir>/gopro-dl/credentials.json;
+    /// `login` and `token` print the resolved path)
     #[arg(long, global = true, value_name = "FILE")]
     credentials: Option<PathBuf>,
 
@@ -53,11 +55,12 @@ enum Cmd {
         #[arg(long)]
         email: Option<String>,
     },
-    /// Store a bearer token copied from plus.gopro.com (the reliable path)
+    /// Store a bearer token copied from plus.gopro.com (the reliable path).
+    /// Omit --access-token to be prompted, keeping it out of shell history.
     Token {
-        #[arg(long, env = "GOPRO_ACCESS_TOKEN")]
-        access_token: String,
-        #[arg(long, env = "GOPRO_REFRESH_TOKEN")]
+        #[arg(long, env = "GOPRO_ACCESS_TOKEN", hide_env_values = true)]
+        access_token: Option<String>,
+        #[arg(long, env = "GOPRO_REFRESH_TOKEN", hide_env_values = true)]
         refresh_token: Option<String>,
     },
     /// Show the account the stored token belongs to
@@ -80,10 +83,13 @@ enum Cmd {
         #[arg(long)]
         hash: bool,
     },
-    /// Summarise what has been archived so far
+    /// Summarise what has been archived so far, in items and bytes
     Stats {
         #[arg(long, value_name = "DIR")]
         dest: PathBuf,
+        /// Re-read the cloud totals from GoPro before reporting
+        #[arg(long)]
+        refresh: bool,
     },
 }
 
@@ -137,6 +143,18 @@ struct SyncArgs {
     #[arg(long)]
     newest_first: bool,
 
+    /// Attempt items GoPro has not finished processing (they normally 403)
+    #[arg(long)]
+    include_unprocessed: bool,
+
+    /// Re-walk the media listing even if the cached one still looks current
+    #[arg(long)]
+    refresh_list: bool,
+
+    /// How long a cached listing may be reused, in hours
+    #[arg(long, default_value_t = 24)]
+    cache_ttl: i64,
+
     /// Items per API page
     #[arg(long, default_value_t = 100)]
     per_page: u32,
@@ -155,25 +173,70 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Login { email } => cmd_login(&creds_path, email).await,
         Cmd::Token { access_token, refresh_token } => {
-            let creds = auth::Credentials {
-                access_token: access_token.trim().trim_start_matches("Bearer ").to_string(),
-                refresh_token,
-                expires_at: None,
+            let raw = match access_token {
+                Some(t) => t,
+                None => rpassword::prompt_password(
+                    "Paste the gp_access_token cookie value (or an Authorization header): ",
+                )?,
             };
-            auth::save(&creds_path, &creds)?;
+            let token = auth::normalize_token(&raw)
+                .context("no token found in that input")?;
+            auth::save(
+                &creds_path,
+                &auth::Credentials { access_token: token, refresh_token, expires_at: None },
+            )?;
             println!("Saved credentials to {}", creds_path.display());
+            println!("Check it with:  gopro-dl whoami");
             Ok(())
         }
         Cmd::Whoami => {
             let api = open_api(&creds_path, 3)?;
-            let user = api.user().await?;
-            println!("{}", serde_json::to_string_pretty(&user)?);
+            let user = api.media_user().await?;
+            println!("GoPro cloud account");
+            if let Some(id) = &user.id {
+                println!("  account id:   {id}");
+            }
+            if let Some(since) = &user.created_at {
+                println!("  member since: {since}");
+            }
+            println!(
+                "  media items:  {}",
+                user.total_count.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
+            );
+            println!(
+                "  cloud size:   {}",
+                user.total_storage.map(human_bytes).unwrap_or_else(|| "?".into())
+            );
             Ok(())
         }
         Cmd::List { limit, json } => cmd_list(&creds_path, limit, json).await,
         Cmd::Sync(args) => cmd_sync(&creds_path, args).await,
         Cmd::Verify { dest, hash } => cmd_verify(&dest, hash).await,
-        Cmd::Stats { dest } => cmd_stats(&dest),
+        Cmd::Stats { dest, refresh } => cmd_stats(&dest, refresh, &creds_path).await,
+    }
+}
+
+/// The live progress display, if one is running. Log records are routed through
+/// it so they cannot interleave with a bar redraw.
+static PROGRESS: std::sync::OnceLock<MultiProgress> = std::sync::OnceLock::new();
+
+/// Writes log lines to stderr, pausing the progress bars for the duration.
+///
+/// Without this, `tracing` and `indicatif` both own the cursor and the output
+/// shreds itself — half-drawn bars spliced into warnings.
+struct BarWriter;
+
+impl std::io::Write for BarWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match PROGRESS.get() {
+            Some(mp) => mp.suspend(|| std::io::stderr().write_all(buf))?,
+            None => std::io::stderr().write_all(buf)?,
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
     }
 }
 
@@ -185,8 +248,56 @@ fn init_logging(verbose: bool) {
         .with_env_filter(filter)
         .without_time()
         .with_target(false)
-        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_writer(|| BarWriter)
         .init();
+}
+
+/// Errors that will never fix themselves. Retrying one of these across 2835
+/// items burns hours to arrive at the same place, so the run stops instead.
+fn fatal_reason(e: &anyhow::Error) -> Option<String> {
+    for cause in e.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            let what = match io.raw_os_error() {
+                Some(1) | Some(13) => "permission denied writing to the destination",
+                Some(28) => "the destination volume is full",
+                Some(30) => "the destination volume is mounted read-only",
+                _ => continue,
+            };
+            return Some(what.to_string());
+        }
+    }
+    None
+}
+
+/// Turn a write failure into something the user can act on.
+fn explain_io(path: &std::path::Path, e: &std::io::Error) -> anyhow::Error {
+    let base = format!("cannot write to {}: {e}", path.display());
+    match e.raw_os_error() {
+        Some(1) | Some(13) => anyhow::anyhow!(
+            "{base}\n\n\
+             macOS blocks programs from writing to removable volumes until you allow it.\n\
+             Open System Settings -> Privacy & Security -> Files and Folders, find your\n\
+             terminal app, and enable \"Removable Volumes\" (Full Disk Access also works).\n\
+             Then re-run the same command."
+        ),
+        Some(28) => anyhow::anyhow!("{base}\n\nThe volume is full."),
+        Some(30) => anyhow::anyhow!("{base}\n\nThe volume is mounted read-only."),
+        _ => anyhow::anyhow!("{base}"),
+    }
+}
+
+/// Prove the destination is usable before spending minutes listing the library.
+fn preflight(dest: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dest).map_err(|e| explain_io(dest, &e))?;
+    let parts = manifest::parts_dir(dest);
+    std::fs::create_dir_all(&parts).map_err(|e| explain_io(&parts, &e))?;
+    // create_dir_all succeeds on an existing directory even when unwritable,
+    // so actually write something.
+    let probe = parts.join(".write-probe");
+    std::fs::write(&probe, b"gopro-dl").map_err(|e| explain_io(&probe, &e))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 fn open_api(creds_path: &std::path::Path, retries: u32) -> Result<Api> {
@@ -247,6 +358,62 @@ async fn cmd_list(creds_path: &std::path::Path, limit: usize, json: bool) -> Res
     Ok(())
 }
 
+/// The media listing, from cache when it is still provably current.
+async fn library(
+    api: &Api,
+    args: &SyncArgs,
+    user: Option<&crate::model::MediaUser>,
+) -> Result<Vec<MediaItem>> {
+    let ttl = chrono::Duration::hours(args.cache_ttl.max(0));
+    let cached = cache::load(&args.dest);
+
+    let stale = match &cached {
+        None => Some("no cached listing yet".to_string()),
+        Some(_) if args.refresh_list => Some("--refresh-list given".to_string()),
+        Some(c) => c.staleness(user, ttl),
+    };
+
+    if let (Some(c), None) = (&cached, &stale) {
+        let age = chrono::Utc::now() - c.fetched_at;
+        info!(
+            "using cached listing: {} items, unchanged since {} ago \
+             (--refresh-list to re-walk)",
+            c.items.len(),
+            approx(age)
+        );
+        return Ok(c.items.clone());
+    }
+    if let Some(why) = &stale {
+        if cached.is_some() {
+            info!("re-listing media: {why}");
+        }
+    }
+
+    let items = collect_library(api, args.per_page.clamp(1, 100)).await?;
+    let entry = cache::LibraryCache {
+        fetched_at: chrono::Utc::now(),
+        account_id: user.and_then(|u| u.id.clone()),
+        total_count: user.and_then(|u| u.total_count),
+        total_storage: user.and_then(|u| u.total_storage),
+        items: items.clone(),
+    };
+    if let Err(e) = cache::save(&args.dest, &entry) {
+        warn!("could not cache the listing: {e:#}");
+    }
+    Ok(items)
+}
+
+fn approx(d: chrono::Duration) -> String {
+    let mins = d.num_minutes().max(0);
+    if mins < 90 {
+        format!("{mins}m")
+    } else if mins < 60 * 48 {
+        format!("{}h", mins / 60)
+    } else {
+        format!("{}d", mins / (60 * 24))
+    }
+}
+
 /// Walk every page of `/media/search` and return the full library.
 async fn collect_library(api: &Api, per_page: u32) -> Result<Vec<MediaItem>> {
     let spinner = ProgressBar::new_spinner();
@@ -285,11 +452,21 @@ async fn cmd_sync(creds_path: &std::path::Path, args: SyncArgs) -> Result<()> {
     if args.jobs == 0 {
         bail!("--jobs must be at least 1");
     }
-    std::fs::create_dir_all(&args.dest)
-        .with_context(|| format!("cannot create destination {}", args.dest.display()))?;
+    preflight(&args.dest)?;
 
     let api = Arc::new(open_api(creds_path, args.retries)?);
-    let mut items = collect_library(&api, args.per_page.clamp(1, 100)).await?;
+
+    // One cheap request that both validates the cached listing and supplies the
+    // account totals used for progress reporting.
+    let user = match api.media_user().await {
+        Ok(u) => Some(u),
+        Err(e) => {
+            warn!("could not read account totals: {e:#}");
+            None
+        }
+    };
+
+    let mut items = library(&api, &args, user.as_ref()).await?;
     let library_size = items.len();
 
     // Filter
@@ -301,38 +478,81 @@ async fn cmd_sync(creds_path: &std::path::Path, args: SyncArgs) -> Result<()> {
             None => false,
         });
     }
+    // Items still uploading or transcoding have signed URLs that 403. Leaving
+    // them out keeps the run clean; they are not recorded, so a later run picks
+    // them up once GoPro finishes.
+    let mut unprocessed = 0usize;
+    if !args.include_unprocessed {
+        items.retain(|i| match i.ready_to_view.as_deref() {
+            Some("ready") | None => true,
+            Some(_) => {
+                unprocessed += 1;
+                false
+            }
+        });
+    }
+
     items.sort_by_key(|i| i.timestamp());
     if args.newest_first {
         items.reverse();
     }
+
+    let mut manifest_init = Manifest::load(&args.dest)?;
+    manifest_init.library_items = Some(library_size as u64);
+    // GoPro reports the account's byte total directly, which is more reliable
+    // than summing per-item sizes (some items report none).
+    if let Some(u) = &user {
+        if let Some(n) = u.total_count {
+            manifest_init.library_items = Some(n.max(library_size as u64));
+        }
+        manifest_init.library_bytes = u.total_storage;
+    }
+
+    // Decide what is left to do *before* touching the network. Asking GoPro for
+    // download links only to find the file already on disk costs one request
+    // per item, which on a resumed run is the entire library.
+    let profile = profile_of(&args);
+    let already_done = {
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(ProgressStyle::with_template("{spinner} {msg}").unwrap());
+        spinner.enable_steady_tick(std::time::Duration::from_millis(120));
+        spinner.set_message("checking what is already on disk…");
+        let before = items.len();
+        items.retain(|i| !manifest_init.item_complete(&args.dest, &i.id, &profile));
+        spinner.finish_and_clear();
+        before - items.len()
+    };
+    if already_done > 0 {
+        info!(
+            "{already_done} item(s) already complete on disk; {} left to fetch",
+            items.len()
+        );
+    }
+
+    // Applied last, so `--limit 20` means twenty items of actual work rather
+    // than twenty items that may all turn out to be done already.
     if let Some(limit) = args.limit {
         items.truncate(limit);
     }
 
-    let mut manifest_init = Manifest::load(&args.dest)?;
-    manifest_init.library_items = Some(library_size as u64);
     let manifest = Arc::new(Mutex::new(manifest_init));
 
+    if unprocessed > 0 {
+        info!(
+            "skipping {unprocessed} item(s) GoPro is still processing; \
+             re-run later to collect them (--include-unprocessed to try anyway)"
+        );
+    }
+
     if args.dry_run {
-        let known: HashSet<String> = manifest
-            .lock()
-            .await
-            .entries
-            .values()
-            .map(|e| e.media_id.clone())
-            .collect();
-        let (mut pending, mut pending_bytes, mut have) = (0usize, 0u64, 0usize);
-        for i in &items {
-            if known.contains(&i.id) {
-                have += 1;
-            } else {
-                pending += 1;
-                pending_bytes += i.size().unwrap_or(0);
-            }
-        }
-        println!("{} items match the filters", items.len());
-        println!("  already recorded: {have}");
-        println!("  to download:      {pending}  (~{} reported by GoPro)", human_bytes(pending_bytes));
+        let pending_bytes: u64 = items.iter().filter_map(|i| i.size()).sum();
+        println!("{} items match the filters", items.len() + already_done);
+        println!("  already complete: {already_done}");
+        println!(
+            "  to download:      {}  (~{} reported by GoPro)",
+            items.len(),
+            human_bytes(pending_bytes)
+        );
         println!("  destination:      {}", args.dest.display());
         let partials = manifest::partials(&args.dest);
         if !partials.is_empty() {
@@ -367,17 +587,11 @@ async fn cmd_sync(creds_path: &std::path::Path, args: SyncArgs) -> Result<()> {
     // GoPro reports a size per item in the search results, so we can show a real
     // byte total and ETA rather than a bare spinner. It is an estimate: it counts
     // one rendition per item, and items already on disk are excluded.
-    let pending_bytes: u64 = {
-        let m = manifest.lock().await;
-        let done: HashSet<&str> = m.entries.values().map(|e| e.media_id.as_str()).collect();
-        items
-            .iter()
-            .filter(|i| !done.contains(i.id.as_str()))
-            .filter_map(|i| i.size())
-            .sum()
-    };
+    // `items` already excludes everything on disk, so this is the work left.
+    let pending_bytes: u64 = items.iter().filter_map(|i| i.size()).sum();
 
     let multi = MultiProgress::new();
+    let _ = PROGRESS.set(multi.clone());
     let overall = multi.add(ProgressBar::new(items.len() as u64));
     overall.set_style(
         ProgressStyle::with_template("{bar:32.cyan/blue} {pos}/{len} items · {msg}")
@@ -400,7 +614,12 @@ async fn cmd_sync(creds_path: &std::path::Path, args: SyncArgs) -> Result<()> {
     let bytes_total = Arc::new(AtomicU64::new(0));
     let files_total = Arc::new(AtomicU64::new(0));
     let skipped = Arc::new(AtomicU64::new(0));
+    let short = Arc::new(AtomicU64::new(0));
     let failures: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    // Set when the run hits something no amount of retrying will fix, or when
+    // enough items fail back-to-back that the problem is clearly systemic.
+    let abort: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let consecutive = Arc::new(AtomicU64::new(0));
     let dest = Arc::new(args.dest.clone());
     let jobs = args.jobs;
     let run_total = items.len();
@@ -416,7 +635,10 @@ async fn cmd_sync(creds_path: &std::path::Path, args: SyncArgs) -> Result<()> {
         let bytes_total = bytes_total.clone();
         let files_total = files_total.clone();
         let skipped = skipped.clone();
+        let short = short.clone();
         let failures = failures.clone();
+        let abort = abort.clone();
+        let consecutive = consecutive.clone();
         let dest = dest.clone();
         let opts = opts.clone();
         let cancel = cancel.clone();
@@ -430,14 +652,35 @@ async fn cmd_sync(creds_path: &std::path::Path, args: SyncArgs) -> Result<()> {
 
             let outcome = sync_one(
                 &api, &item, &dest, &opts, &manifest, &claimed, &multi, &bytes_total,
-                &files_total, &skipped, &cancel, &overall, run_total,
+                &files_total, &skipped, &short, &cancel, &overall, run_total,
             )
             .await;
 
             match outcome {
-                Ok(()) => {}
+                Ok(()) => {
+                    consecutive.store(0, Ordering::SeqCst);
+                }
                 Err(e) if e.downcast_ref::<download::Cancelled>().is_some() => {}
                 Err(e) => {
+                    let run = consecutive.fetch_add(1, Ordering::SeqCst) + 1;
+
+                    if let Some(reason) = fatal_reason(&e) {
+                        let mut slot = abort.lock().await;
+                        if slot.is_none() {
+                            *slot = Some(reason);
+                        }
+                        cancel.store(true, Ordering::SeqCst);
+                    } else if run >= CONSECUTIVE_FAILURE_LIMIT {
+                        let mut slot = abort.lock().await;
+                        if slot.is_none() {
+                            *slot = Some(format!(
+                                "{run} items failed in a row — stopping rather than \
+                                 working through the whole library"
+                            ));
+                        }
+                        cancel.store(true, Ordering::SeqCst);
+                    }
+
                     warn!("{name} ({}) failed: {e:#}", item.id);
                     failures.lock().await.push((item.id.clone(), format!("{e:#}")));
                 }
@@ -466,15 +709,25 @@ async fn cmd_sync(creds_path: &std::path::Path, args: SyncArgs) -> Result<()> {
     }
 
     let failures = failures.lock().await;
-    let archived = { manifest.lock().await.media_count() };
     println!(
-        "\nDownloaded {} files ({}) this run; skipped {} already present.",
+        "\nDownloaded {} files ({}) this run; {} item(s) were already complete.",
         files_total.load(Ordering::SeqCst),
         human_bytes(bytes_total.load(Ordering::SeqCst)),
-        skipped.load(Ordering::SeqCst)
+        already_done + skipped.load(Ordering::SeqCst) as usize
     );
-    println!("Archived {archived}/{library_size} items in the cloud library.");
-    println!("Archive: {}", dest.display());
+    {
+        let m = manifest.lock().await;
+        print_progress(&m);
+    }
+    println!("Archive:   {}", dest.display());
+    let short_count = short.load(Ordering::SeqCst);
+    if short_count > 0 {
+        println!(
+            "\n{short_count} file(s) did not match the size GoPro reports. \
+             Run `gopro-dl verify --dest {}` and inspect them.",
+            dest.display()
+        );
+    }
     if !failures.is_empty() {
         println!("\n{} item(s) failed — re-run `sync` to retry them:", failures.len());
         for (id, err) in failures.iter().take(20) {
@@ -484,6 +737,15 @@ async fn cmd_sync(creds_path: &std::path::Path, args: SyncArgs) -> Result<()> {
             println!("  … and {} more", failures.len() - 20);
         }
     }
+    if let Some(reason) = abort.lock().await.clone() {
+        println!("\nRun stopped early: {reason}.");
+        println!("Nothing already downloaded was lost; fix the cause and re-run to continue.");
+        if let Some((_, first)) = failures.first() {
+            println!("\nFirst error was:\n  {first}");
+        }
+        bail!("sync aborted: {reason}");
+    }
+
     if cancel.load(Ordering::SeqCst) {
         let partials = manifest::partials(&dest);
         println!(
@@ -508,6 +770,7 @@ async fn sync_one(
     bytes_total: &AtomicU64,
     files_total: &AtomicU64,
     skipped: &AtomicU64,
+    short: &AtomicU64,
     cancel: &AtomicBool,
     overall: &ProgressBar,
     run_total: usize,
@@ -555,8 +818,15 @@ async fn sync_one(
             }
         }
         let planned = planned.as_ref().expect("just populated");
+        let originals = planned
+            .iter()
+            .filter(|a| a.asset_key.starts_with("original:"))
+            .count();
         if planned.is_empty() {
-            bail!("GoPro returned no downloadable assets (item may still be processing)");
+            bail!(
+                "GoPro offered no downloadable assets (state: {})",
+                item.ready_to_view.as_deref().unwrap_or("unknown")
+            );
         }
 
         let mut all_ok = true;
@@ -599,9 +869,28 @@ async fn sync_one(
             )
             .await;
             pb.finish_and_clear();
+            multi.remove(&pb);
 
             match res {
                 Ok(bytes) => {
+                    // GoPro's per-item `file_size` is the size of the original.
+                    // A mismatch means we fetched a different rendition than we
+                    // meant to — the failure mode that silently fills an archive
+                    // with 720p proxies — so surface it loudly.
+                    if asset.asset_key.starts_with("original:") && originals == 1 {
+                        if let Some(expected) = item.size() {
+                            if bytes != expected {
+                                short.fetch_add(1, Ordering::SeqCst);
+                                warn!(
+                                    "{}: got {} but GoPro reports {} for this item — \
+                                     check the rendition",
+                                    asset.rel_path.display(),
+                                    human_bytes(bytes),
+                                    human_bytes(expected)
+                                );
+                            }
+                        }
+                    }
                     let sha256 = if opts.hash {
                         Some(download::sha256_of(&target).await?)
                     } else {
@@ -627,6 +916,9 @@ async fn sync_one(
                     });
                 }
                 Err(e) if e.downcast_ref::<download::Cancelled>().is_some() => return Err(e),
+                // A full disk or a permission problem will fail identically on
+                // every retry; surface it now instead of after five backoffs.
+                Err(e) if fatal_reason(&e).is_some() => return Err(e),
                 Err(e) => {
                     // Expired signature: re-mint links and try the item again.
                     if e.downcast_ref::<download::UrlExpired>().is_some() {
@@ -645,12 +937,28 @@ async fn sync_one(
             if opts.metadata {
                 write_metadata(dest, item, planned)?;
             }
+            // Only now, with every planned asset on disk, is the item finished.
+            manifest.lock().await.mark_complete(&item.id, &profile_of(opts));
             return Ok(());
         }
         tokio::time::sleep(backoff(attempt)).await;
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("gave up after {} attempts", opts.retries)))
+}
+
+/// How many back-to-back item failures before we conclude the problem is not
+/// per-item and stop.
+const CONSECUTIVE_FAILURE_LIMIT: u64 = 12;
+
+/// Identifies the set of assets a run asks for, so a later run can tell
+/// "nothing left to do" from "you changed the flags, look again".
+fn profile_of(args: &SyncArgs) -> String {
+    let mut p = args.variant.as_str().to_string();
+    if args.sidecars {
+        p.push_str("+sidecars");
+    }
+    p
 }
 
 fn backoff(attempt: u32) -> std::time::Duration {
@@ -721,30 +1029,76 @@ async fn cmd_verify(dest: &std::path::Path, hash: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stats(dest: &std::path::Path) -> Result<()> {
-    let m = Manifest::load(dest)?;
-    let archived = m.media_count();
+/// The "how far along am I" block — in items *and* bytes, because 1200 of 2838
+/// items says little when clip sizes range from 50 MB to 2.3 GB.
+fn print_progress(m: &Manifest) {
+    let have_bytes = m.total_bytes();
+    let archived = m.media_count() as u64;
+
+    match m.library_items {
+        Some(total) if total > 0 => println!(
+            "Items:     {archived}/{total} archived ({:.1}%)",
+            archived as f64 / total as f64 * 100.0
+        ),
+        _ => println!("Items:     {archived} archived"),
+    }
+    match m.library_bytes {
+        Some(total) if total > 0 => println!(
+            "Size:      {} of ~{} ({:.1}%)",
+            human_bytes(have_bytes),
+            human_bytes(total),
+            (have_bytes as f64 / total as f64 * 100.0).min(100.0)
+        ),
+        _ => println!("Size:      {}", human_bytes(have_bytes)),
+    }
+
+    let items_left = m.library_items.map(|t| t.saturating_sub(archived));
+    let bytes_left = m.library_bytes.map(|t| t.saturating_sub(have_bytes));
+    if items_left.is_some() || bytes_left.is_some() {
+        let items = items_left.map(|n| format!("{n} items")).unwrap_or_default();
+        let bytes = bytes_left
+            .map(|n| format!("~{} to fetch", human_bytes(n)))
+            .unwrap_or_default();
+        let parts: Vec<&str> = [items.as_str(), bytes.as_str()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !parts.is_empty() {
+            println!("Remaining: {}", parts.join(", "));
+        }
+    }
+    println!("Files:     {} on disk", m.entries.len());
+}
+
+async fn cmd_stats(dest: &std::path::Path, refresh: bool, creds: &std::path::Path) -> Result<()> {
+    let mut m = Manifest::load(dest)?;
+
+    if refresh {
+        let api = open_api(creds, 3)?;
+        let user = api.media_user().await.context("refreshing account totals")?;
+        if let Some(n) = user.total_count {
+            m.library_items = Some(n);
+        }
+        if let Some(b) = user.total_storage {
+            m.library_bytes = Some(b);
+        }
+        m.save(dest)?;
+    }
 
     println!("Archive:   {}", dest.display());
-    match m.library_items {
-        Some(total) if total > 0 => {
-            let pct = archived as f64 / total as f64 * 100.0;
-            println!("Items:     {archived}/{total} archived ({pct:.1}%)");
-            println!("Remaining: {}", total.saturating_sub(archived as u64));
-        }
-        _ => println!("Items:     {archived} archived (run `sync` to learn the cloud total)"),
-    }
-    println!("Files:     {}", m.entries.len());
-    println!("Size:      {}", human_bytes(m.total_bytes()));
+    print_progress(&m);
     if let Some(t) = m.last_sync {
         println!("Last sync: {}", t.format("%Y-%m-%d %H:%M:%S UTC"));
+    }
+    if m.library_bytes.is_none() {
+        println!("(run `gopro-dl stats --refresh` to pull the cloud totals)");
     }
 
     let partials = manifest::partials(dest);
     if !partials.is_empty() {
         let bytes: u64 = partials.iter().map(|(_, n)| n).sum();
         println!(
-            "Partial:   {} interrupted transfer(s), {} already fetched — `sync` resumes them",
+            "Partial:   {} interrupted transfer(s) holding {} — `sync` resumes them",
             partials.len(),
             human_bytes(bytes)
         );
@@ -765,7 +1119,7 @@ fn cmd_stats(dest: &std::path::Path) -> Result<()> {
     if !by_year.is_empty() {
         println!("\nBy year:");
         for (year, (count, bytes)) in by_year {
-            println!("  {year}  {count:>6} files  {:>10}", human_bytes(bytes));
+            println!("  {year}  {count:>6} files  {:>12}", human_bytes(bytes));
         }
     }
     Ok(())
